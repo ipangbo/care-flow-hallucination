@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "care-core"
+version = "1.0.0"
+description = "Minimal code for the main CARE multi-image experiments"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.4",
+  "torchvision>=0.19",
+  "transformers>=5.0.0,<6",
+  "accelerate>=1.0",
+  "datasets>=3.0",
+  "huggingface_hub>=0.28",
+  "pandas>=2.0",
+  "pyarrow>=15",
+  "pillow>=10",
+  "tqdm>=4.66",
+  "safetensors>=0.4",
+  "sentencepiece>=0.2",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

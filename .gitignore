@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+.env
+.env.*
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Large or generated experiment artifacts
+datasets/
+results/
+checkpoints/
+outputs/
+*.jsonl
+*.summary.json
+
+# Editor and OS metadata
+.DS_Store
+.idea/
+.vscode/
+*~
