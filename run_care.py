@@ -26,8 +26,9 @@ from care_flow.models.qwen_vl import QwenVLBackend
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Run paper CARE-Flow: pre-response Bridge proposal, exact source-grouped "
-            "attention value-output certification, hard reset, and paired null-Bridge verification."
+            "Run paper CARE-Flow: question-only specification, Bridge proposal, exact "
+            "source-grouped certification, hard reset, fixed-operator composition, "
+            "and paired null-Bridge verification."
         )
     )
     parser.add_argument("--dataset-dir", required=True)
@@ -43,10 +44,8 @@ def main() -> None:
         nargs="*",
         default=None,
         help=(
-            "Optional Vanilla JSONL files. Their prediction field becomes the "
-            "paired initial hypothesis, including null predictions for parse "
-            "failures; candidate likelihoods are still computed for CARE's "
-            "residual verifier."
+            "Optional Vanilla JSONL files used only for paired baseline metrics. "
+            "Vanilla predictions and scores never enter CARE's decision path."
         ),
     )
     parser.add_argument("--limit", type=int, default=0)
@@ -72,33 +71,17 @@ def main() -> None:
     parser.add_argument("--max-image-side", type=int, default=768)
 
     parser.add_argument("--epsilon", type=float, default=0.9)
-    parser.add_argument("--kappa", type=float, default=0.0)
-    parser.add_argument("--rho", type=float, default=0.3)
-    parser.add_argument("--kappa-min", type=float, default=0.0)
-    parser.add_argument("--epsilon0", type=float, default=1e-8)
-    parser.add_argument("--gamma", type=float, default=1.0)
-    parser.add_argument("--eta", type=float, default=6.0)
+    parser.add_argument("--gamma", type=float, default=0.0)
+    parser.add_argument("--eta", type=float, default=0.0)
     parser.add_argument("--max-atoms", type=int, default=5)
+    parser.add_argument("--specification-max-new-tokens", type=int, default=256)
     parser.add_argument("--proposal-max-new-tokens", type=int, default=320)
+    parser.add_argument("--composition-max-new-tokens", type=int, default=128)
     parser.add_argument("--answer-max-new-tokens", type=int, default=96)
-    parser.add_argument("--residual-rerank-weight", type=float, default=1.5)
-    parser.add_argument("--factual-support-weight", type=float, default=2.0 / 3.0)
-    parser.add_argument("--residual-rerank-margin", type=float, default=0.4)
-    parser.add_argument("--baseline-margin-cap", type=float, default=0.75)
-    parser.add_argument(
-        "--selective-only",
-        action="store_true",
-        help="Abstain when no candidate passes verification instead of retaining the initial hypothesis.",
-    )
     parser.add_argument(
         "--joint-proposal",
         action="store_true",
-        help="Use one joint multi-image Bridge proposal instead of source-isolated acquisition.",
-    )
-    parser.add_argument(
-        "--hard-unknown-only",
-        action="store_true",
-        help="Ablation: replace every failed atom with unknown instead of retaining a tentative value.",
+        help="Fill all fixed roles in one call instead of independent role branches.",
     )
 
     parser.add_argument("--resume", action="store_true")
@@ -172,25 +155,15 @@ def main() -> None:
     done_ids = {str(record.get("instance_id")) for record in records}
     pending = [row for row in selected if str(row.get("instance_id")) not in done_ids]
 
-    certification = CertificationConfig(
-        epsilon=args.epsilon,
-        kappa=args.kappa,
-        rho=args.rho,
-        kappa_min=args.kappa_min,
-        epsilon0=args.epsilon0,
-    )
+    certification = CertificationConfig(epsilon=args.epsilon)
     verification = VerificationConfig(gamma=args.gamma, eta=args.eta)
     flow = FlowConfig(
         max_atoms=args.max_atoms,
+        specification_max_new_tokens=args.specification_max_new_tokens,
         proposal_max_new_tokens=args.proposal_max_new_tokens,
+        composition_max_new_tokens=args.composition_max_new_tokens,
         answer_max_new_tokens=args.answer_max_new_tokens,
-        retain_initial_on_rejection=not args.selective_only,
-        source_isolated_proposal=not args.joint_proposal,
-        retain_tentative_atoms=not args.hard_unknown_only,
-        residual_rerank_weight=args.residual_rerank_weight,
-        factual_support_weight=args.factual_support_weight,
-        residual_rerank_margin=args.residual_rerank_margin,
-        baseline_margin_cap=args.baseline_margin_cap,
+        role_isolated_proposal=not args.joint_proposal,
     )
     backend = QwenVLBackend(
         model_path=model_path,

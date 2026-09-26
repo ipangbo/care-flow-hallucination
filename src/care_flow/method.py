@@ -20,6 +20,7 @@ INTEGER_RE = re.compile(r"\d+")
 class EvidenceAtom:
     """One source-indexed atomic field in the provisional CARE-Bridge."""
 
+    role_id: str
     sources: tuple[int, ...]
     field: str
     value: str
@@ -32,56 +33,61 @@ class EvidenceAtom:
 
 
 @dataclass(frozen=True)
+class EvidenceRole:
+    """One answer-free operand role fixed from the question alone."""
+
+    role_id: str
+    description: str
+
+
+@dataclass(frozen=True)
+class EvidenceSpecification:
+    """Question-only operand roles and the fixed composition operator."""
+
+    roles: tuple[EvidenceRole, ...]
+    operator: str
+    operator_dag: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class CertificationConfig:
-    """Paper thresholds for the X -> M causal certification leg."""
+    """Configuration for exact source-grouped necessity estimation."""
 
     epsilon: float = 0.9
-    kappa: float = 0.0
-    rho: float = 0.3
-    kappa_min: float = 0.0
-    epsilon0: float = 1e-8
 
     def __post_init__(self) -> None:
         if not 0.0 < self.epsilon < 1.0:
             raise ValueError("epsilon must lie strictly between zero and one")
-        if not 0.0 <= self.rho <= 1.0:
-            raise ValueError("rho must lie in [0, 1]")
-        if self.epsilon0 <= 0.0:
-            raise ValueError("epsilon0 must be positive")
 
 
 @dataclass(frozen=True)
 class VerificationConfig:
-    """Paper thresholds for selective Bridge-only response verification."""
+    """Natural zero boundaries for Bridge-only response verification."""
 
-    gamma: float = 1.0
-    eta: float = 6.0
+    gamma: float = 0.0
+    eta: float = 0.0
 
 
 @dataclass(frozen=True)
 class FlowConfig:
     max_atoms: int = 5
+    specification_max_new_tokens: int = 256
     proposal_max_new_tokens: int = 320
+    composition_max_new_tokens: int = 128
     answer_max_new_tokens: int = 96
-    retain_initial_on_rejection: bool = True
-    source_isolated_proposal: bool = True
-    retain_tentative_atoms: bool = True
-    residual_rerank_weight: float = 1.5
-    factual_support_weight: float = 2.0 / 3.0
-    residual_rerank_margin: float = 0.4
-    baseline_margin_cap: float = 0.75
+    role_isolated_proposal: bool = True
 
     def __post_init__(self) -> None:
         if self.max_atoms <= 0:
             raise ValueError("max_atoms must be positive")
-        if self.residual_rerank_weight < 0.0:
-            raise ValueError("residual_rerank_weight must be non-negative")
-        if not 0.0 <= self.factual_support_weight <= 1.0:
-            raise ValueError("factual_support_weight must lie in [0, 1]")
-        if not 0.0 <= self.residual_rerank_margin <= 1.0:
-            raise ValueError("residual_rerank_margin must lie in [0, 1]")
-        if self.baseline_margin_cap < 0.0:
-            raise ValueError("baseline_margin_cap must be non-negative")
+        for name in (
+            "specification_max_new_tokens",
+            "proposal_max_new_tokens",
+            "composition_max_new_tokens",
+            "answer_max_new_tokens",
+        ):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive")
 
 
 def select_rows(
@@ -138,29 +144,31 @@ def run_care_flow_on_row(
     image_paths = resolve_image_paths(row, dataset_dir)
     candidates = list(row.get("candidates") or [])
 
+    # Specify_theta(Q) is completed before the model sees any image or response.
+    # The resulting roles and operator remain fixed for the rest of the run.
+    backend.reset_multimodal_state()
+    specification = specify_evidence_structure(
+        backend,
+        question,
+        max_roles=flow.max_atoms,
+        max_new_tokens=flow.specification_max_new_tokens,
+    )
     provisional = propose_bridge(
         backend,
         question,
         image_paths,
+        specification,
         max_atoms=flow.max_atoms,
         max_new_tokens=flow.proposal_max_new_tokens,
-        source_isolated=flow.source_isolated_proposal,
+        role_isolated=flow.role_isolated_proposal,
     )
     certified_atoms = [
         certify_atom(atom, question, image_paths, backend, certification)
         for atom in provisional
     ]
 
-    factual_bridge = render_bridge(
-        certified_atoms,
-        null=False,
-        retain_tentative=flow.retain_tentative_atoms,
-    )
-    null_bridge = render_bridge(
-        certified_atoms,
-        null=True,
-        retain_tentative=flow.retain_tentative_atoms,
-    )
+    factual_bridge = render_bridge(certified_atoms, null=False)
+    null_bridge = render_bridge(certified_atoms, null=True)
 
     baseline_scores: dict[str, float] = {}
     baseline_generated: str | None = None
@@ -204,15 +212,37 @@ def run_care_flow_on_row(
                 max_new_tokens=flow.answer_max_new_tokens,
             ).strip()
 
-    # Constructed hard reset: every verification and structured-decoding call
-    # below receives no image-derived state. In forced-choice mode the initial
-    # hypothesis may be retained when CARE has no supported correction;
-    # selective-only mode instead abstains and preserves strict mediation.
+    # Constructed hard reset: every composition, generation, and verification
+    # call below is a new text-only computation with no image-derived state.
     backend.reset_multimodal_state()
+
+    factual_composition = compose_bridge(
+        backend,
+        question,
+        specification,
+        certified_atoms,
+        factual_bridge,
+        null=False,
+        max_new_tokens=flow.composition_max_new_tokens,
+    )
+    null_composition = compose_bridge(
+        backend,
+        question,
+        specification,
+        certified_atoms,
+        null_bridge,
+        null=True,
+        max_new_tokens=flow.composition_max_new_tokens,
+    )
 
     if not candidates:
         generated = backend.generate_text(
-            build_generation_prompt(question, factual_bridge),
+            build_generation_prompt(
+                question,
+                specification,
+                factual_bridge,
+                factual_composition,
+            ),
             max_new_tokens=flow.answer_max_new_tokens,
         ).strip()
         hypotheses = [generated] if generated else []
@@ -223,30 +253,15 @@ def run_care_flow_on_row(
             question,
             factual_bridge,
             null_bridge,
+            factual_composition,
+            null_composition,
             hypothesis,
             verification,
         )
         for hypothesis in hypotheses
     ]
     attach_candidate_metadata(response_scores, candidates)
-    structured_candidate_id = structured_bridge_candidate_id(
-        certified_atoms,
-        response_scores,
-        include_tentative=flow.retain_tentative_atoms,
-    )
-    selected, selected_via = select_verified_response(
-        response_scores,
-        baseline_candidate.get("candidate_id") if baseline_candidate else None,
-        retain_initial_on_rejection=flow.retain_initial_on_rejection,
-        structured_candidate_id=structured_candidate_id,
-        baseline_scores=baseline_scores,
-        residual_rerank_weight=(
-            flow.residual_rerank_weight if flow.retain_initial_on_rejection else 0.0
-        ),
-        factual_support_weight=flow.factual_support_weight,
-        residual_rerank_margin=flow.residual_rerank_margin,
-        baseline_margin_cap=flow.baseline_margin_cap,
-    )
+    selected, selected_via = select_verified_response(response_scores)
 
     candidate_by_text = {
         str(candidate.get("text", "")).strip(): candidate for candidate in candidates
@@ -304,10 +319,13 @@ def run_care_flow_on_row(
         "care_error_label": selected_error_label(selected_candidate, gold_id),
         "care_selected_via": selected_via,
         "baseline_scores": baseline_scores,
+        "evidence_specification": asdict(specification),
         "provisional_bridge": [asdict(atom) | {"claim": atom.claim} for atom in provisional],
         "certified_bridge": certified_atoms,
         "factual_bridge_text": factual_bridge,
         "null_bridge_text": null_bridge,
+        "factual_composition": factual_composition,
+        "null_composition": null_composition,
         "response_scores": response_scores,
         "source_metrics": source_metrics,
         "hard_reset": {
@@ -316,7 +334,7 @@ def run_care_flow_on_row(
             "multimodal_hidden_states_removed": True,
             "kv_cache_reused": False,
         },
-        "method": "care_flow_exact_source_value_output",
+        "method": "care_flow_specify_certify_compose",
         "certification_config": asdict(certification),
         "verification_config": asdict(verification),
         "flow_config": asdict(flow),
@@ -326,133 +344,20 @@ def run_care_flow_on_row(
 
 def select_verified_response(
     response_scores: Sequence[dict[str, Any]],
-    initial_candidate_id: Any,
-    retain_initial_on_rejection: bool,
-    structured_candidate_id: Any = None,
-    baseline_scores: dict[str, float] | None = None,
-    residual_rerank_weight: float = 0.0,
-    factual_support_weight: float = 2.0 / 3.0,
-    residual_rerank_margin: float = 0.4,
-    baseline_margin_cap: float = 0.75,
 ) -> tuple[dict[str, Any] | None, str]:
-    """Apply CARE verification as a conservative correction to a hypothesis."""
+    """Return the valid response with maximum factual Bridge support."""
 
-    if structured_candidate_id is not None:
-        structured = next(
-            (
-                score
-                for score in response_scores
-                if score.get("candidate_id") == structured_candidate_id
-            ),
-            None,
-        )
-        if structured is not None:
-            return structured, "structured_bridge_decoding"
     valid = [score for score in response_scores if score.get("accepted")]
     if valid:
         return max(valid, key=lambda item: (item["r1"], item["response"])), "verified"
-    residual = residual_reranked_response(
-        response_scores,
-        baseline_scores or {},
-        residual_rerank_weight=residual_rerank_weight,
-        factual_support_weight=factual_support_weight,
-        residual_rerank_margin=residual_rerank_margin,
-        baseline_margin_cap=baseline_margin_cap,
-    )
-    if residual is not None:
-        return residual, "bridge_residual_reranking"
-    if retain_initial_on_rejection and initial_candidate_id is not None:
-        initial = next(
-            (
-                score
-                for score in response_scores
-                if score.get("candidate_id") == initial_candidate_id
-            ),
-            None,
-        )
-        if initial is not None:
-            return initial, "initial_hypothesis_retained"
     return None, "abstained"
-
-
-def residual_reranked_response(
-    response_scores: Sequence[dict[str, Any]],
-    baseline_scores: dict[str, float],
-    residual_rerank_weight: float,
-    factual_support_weight: float,
-    residual_rerank_margin: float,
-    baseline_margin_cap: float,
-) -> dict[str, Any] | None:
-    """Rerank an initial candidate distribution with relative Bridge support.
-
-    Absolute verifier logits are poorly calibrated across task families. This
-    rule keeps the same factual/null Bridge intervention but uses only
-    within-question relative support. A margin gate leaves ambiguous cases at
-    the initial hypothesis.
-    """
-
-    if residual_rerank_weight <= 0.0 or len(response_scores) < 2:
-        return None
-    responses = [str(score.get("response", "")).strip() for score in response_scores]
-    if len(set(responses)) != len(responses) or any(
-        response not in baseline_scores for response in responses
-    ):
-        return None
-
-    raw_baseline = [float(baseline_scores[response]) for response in responses]
-    baseline_order = sorted(raw_baseline, reverse=True)
-    if baseline_order[0] - baseline_order[1] > baseline_margin_cap:
-        return None
-    baseline = minmax_normalize(raw_baseline)
-    factual = minmax_normalize([float(score["r1"]) for score in response_scores])
-    uplift = minmax_normalize(
-        [float(score["delta_fd"]) for score in response_scores]
-    )
-    bridge = [
-        factual_support_weight * factual[index]
-        + (1.0 - factual_support_weight) * uplift[index]
-        for index in range(len(response_scores))
-    ]
-    bridge_order = sorted(
-        range(len(response_scores)),
-        key=lambda index: (
-            bridge[index],
-            str(response_scores[index].get("candidate_id", "")),
-        ),
-        reverse=True,
-    )
-    if bridge[bridge_order[0]] - bridge[bridge_order[1]] < residual_rerank_margin:
-        return None
-
-    selected_index = max(
-        range(len(response_scores)),
-        key=lambda index: (
-            baseline[index] + residual_rerank_weight * bridge[index],
-            bridge[index],
-            baseline[index],
-            str(response_scores[index].get("candidate_id", "")),
-        ),
-    )
-    return response_scores[selected_index]
-
-
-def minmax_normalize(values: Sequence[float]) -> list[float]:
-    if not values:
-        return []
-    lower = min(values)
-    span = max(values) - lower
-    if span <= 1e-12:
-        return [0.0 for _ in values]
-    return [(value - lower) / span for value in values]
 
 
 def apply_decision_policy(
     record: dict[str, Any],
     verification: VerificationConfig,
-    retain_initial_on_rejection: bool,
-    flow: FlowConfig | None = None,
 ) -> dict[str, Any]:
-    """Reapply frozen verifier thresholds without rerunning the model."""
+    """Reapply the factual/null acceptance boundary without model inference."""
 
     import copy
 
@@ -463,34 +368,7 @@ def apply_decision_policy(
             float(score["r1"]) > verification.gamma
             and float(score["delta_fd"]) > verification.eta
         )
-    if flow is None:
-        stored_flow = out.get("flow_config") or {}
-        flow = FlowConfig(
-            **{
-                key: value
-                for key, value in stored_flow.items()
-                if key in FlowConfig.__dataclass_fields__
-            }
-        )
-    selected, selected_via = select_verified_response(
-        response_scores,
-        out.get("baseline_candidate_id"),
-        retain_initial_on_rejection,
-        structured_candidate_id=structured_bridge_candidate_id(
-            out.get("certified_bridge", []),
-            response_scores,
-            include_tentative=bool(
-                (out.get("flow_config") or {}).get("retain_tentative_atoms")
-            ),
-        ),
-        baseline_scores=out.get("baseline_scores") or {},
-        residual_rerank_weight=(
-            flow.residual_rerank_weight if retain_initial_on_rejection else 0.0
-        ),
-        factual_support_weight=flow.factual_support_weight,
-        residual_rerank_margin=flow.residual_rerank_margin,
-        baseline_margin_cap=flow.baseline_margin_cap,
-    )
+    selected, selected_via = select_verified_response(response_scores)
     selected_id = selected.get("candidate_id") if selected else None
     gold_id = out.get("gold_candidate_id")
     out.update(
@@ -508,116 +386,136 @@ def apply_decision_policy(
             "verification_config": asdict(verification),
         }
     )
-    flow_config = out.get("flow_config")
-    if isinstance(flow_config, dict):
-        flow_config["retain_initial_on_rejection"] = retain_initial_on_rejection
-        flow_config["residual_rerank_weight"] = flow.residual_rerank_weight
-        flow_config["factual_support_weight"] = flow.factual_support_weight
-        flow_config["residual_rerank_margin"] = flow.residual_rerank_margin
-        flow_config["baseline_margin_cap"] = flow.baseline_margin_cap
     return out
 
 
-def structured_bridge_candidate_id(
-    atoms: Sequence[dict[str, Any]],
-    response_scores: Sequence[dict[str, Any]],
-    include_tentative: bool,
-) -> Any:
-    """Compose structured presence atoms after the hard reset."""
+def specify_evidence_structure(
+    backend: Any,
+    question: str,
+    max_roles: int,
+    max_new_tokens: int,
+) -> EvidenceSpecification:
+    """Run answer-free Specify_theta(Q) without images or candidate responses."""
 
-    presence: dict[int, bool] = {}
-    for atom in atoms:
-        if atom.get("field") != "requested cue presence":
-            continue
-        if not atom.get("certified") and not include_tentative:
-            continue
-        sources = list(atom.get("sources") or [])
-        value = str(
-            atom.get("value")
-            if atom.get("certified")
-            else atom.get("proposed_value")
-        ).casefold()
-        if len(sources) == 1 and value in {"present", "absent"}:
-            presence[int(sources[0])] = value == "present"
-    if not presence:
+    prompt = build_specification_prompt(question, max_roles)
+    raw = backend.generate_text(prompt, max_new_tokens=max_new_tokens)
+    specification = parse_evidence_specification(raw, max_roles=max_roles)
+    if specification is None:
+        retry = (
+            prompt
+            + "\n\nThe previous output was invalid. Return one JSON object with non-empty "
+            "roles and a non-empty operator. Do not include evidence values or an answer."
+        )
+        raw = backend.generate_text(retry, max_new_tokens=max_new_tokens)
+        specification = parse_evidence_specification(raw, max_roles=max_roles)
+    if specification is None:
+        raise ValueError("Specify_theta(Q) did not produce a valid evidence specification")
+    return specification
+
+
+def parse_evidence_specification(
+    raw: str, max_roles: int
+) -> EvidenceSpecification | None:
+    payload = extract_json_payload(raw)
+    if not isinstance(payload, dict):
         return None
 
-    by_text = {
-        str(score.get("response", "")).strip().casefold(): score
-        for score in response_scores
-    }
-    exact_image_choices = {
-        int(match.group(1)): score
-        for text, score in by_text.items()
-        if (match := re.fullmatch(r"image\s+(\d+)", text))
-    }
-    positives = [source for source, visible in presence.items() if visible]
-    if exact_image_choices and len(exact_image_choices) == len(by_text):
-        if len(positives) != 1:
-            return None
-        selected = exact_image_choices.get(positives[0])
-        return selected.get("candidate_id") if selected else None
-
-    if len(presence) == 2:
-        if len(positives) == 2:
-            target = "both images"
-        elif not positives:
-            target = "neither image"
+    raw_roles = payload.get("roles", payload.get("required_roles", []))
+    if not isinstance(raw_roles, list):
+        return None
+    roles: list[EvidenceRole] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw_roles, start=1):
+        if isinstance(item, str):
+            role_id = f"r{index}"
+            description = clean_scalar(item)
+        elif isinstance(item, dict):
+            role_id = clean_scalar(
+                item.get("id", item.get("role_id", item.get("name", f"r{index}")))
+            )
+            description = clean_scalar(
+                item.get(
+                    "description",
+                    item.get("role", item.get("required_evidence", item.get("field", ""))),
+                )
+            )
         else:
-            target = f"image {positives[0]} only"
-        selected = by_text.get(target)
-        return selected.get("candidate_id") if selected else None
-    return None
+            continue
+        role_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", role_id).strip("_") or f"r{index}"
+        if not description or role_id in seen:
+            continue
+        seen.add(role_id)
+        roles.append(EvidenceRole(role_id=role_id, description=description))
+        if len(roles) >= max_roles:
+            break
+
+    raw_operator = payload.get("operator", payload.get("composition", ""))
+    raw_dag = payload.get("operator_dag", payload.get("dag", []))
+    if isinstance(raw_operator, dict):
+        operator_name = clean_scalar(raw_operator.get("name", raw_operator.get("type", "")))
+        operator_description = clean_scalar(
+            raw_operator.get("description", raw_operator.get("instruction", ""))
+        )
+        operator = ": ".join(
+            part for part in (operator_name, operator_description) if part
+        )
+        if not raw_dag:
+            raw_dag = raw_operator.get("dag", raw_operator.get("steps", []))
+    else:
+        operator = clean_scalar(raw_operator)
+
+    dag: list[str] = []
+    if isinstance(raw_dag, list):
+        dag = [clean_scalar(step) for step in raw_dag]
+    elif raw_dag:
+        dag = [clean_scalar(raw_dag)]
+    dag = [step for step in dag if step]
+    if not roles or not operator:
+        return None
+    return EvidenceSpecification(tuple(roles), operator, tuple(dag))
 
 
 def propose_bridge(
     backend: Any,
     question: str,
     image_paths: Sequence[Path],
+    specification: EvidenceSpecification,
     max_atoms: int,
     max_new_tokens: int,
-    source_isolated: bool = True,
+    role_isolated: bool = True,
 ) -> list[EvidenceAtom]:
-    if source_isolated:
+    """Fill only the roles fixed by Specify_theta(Q), without composing them."""
+
+    roles = list(specification.roles[:max_atoms])
+    if role_isolated:
         atoms: list[EvidenceAtom] = []
-        for source in proposal_source_slots(question, len(image_paths)):
-            if uses_binary_presence_schema(question):
-                yes_no = backend.score_multimodal_candidates(
-                    build_source_presence_prompt(question, source, len(image_paths)),
-                    [image_paths[source - 1]],
-                    ["Yes", "No"],
-                )
-                value = "present" if yes_no["Yes"] > yes_no["No"] else "absent"
-                atoms.append(
-                    EvidenceAtom((source,), "requested cue presence", value)
-                )
-                if len(atoms) >= max_atoms:
-                    break
-                continue
-            prompt = build_source_isolated_proposal_prompt(
-                question, source, len(image_paths)
+        for role in roles:
+            prompt = build_role_proposal_prompt(
+                question, specification, role, len(image_paths)
             )
             raw = backend.generate_multimodal(
-                prompt, [image_paths[source - 1]], max_new_tokens=max_new_tokens
+                prompt, list(image_paths), max_new_tokens=max_new_tokens
             )
             parsed = parse_bridge_proposal(
                 raw, num_images=len(image_paths), max_atoms=1
             )
             if parsed:
                 atom = parsed[0]
-                atoms.append(EvidenceAtom((source,), atom.field, atom.value))
-            if len(atoms) >= max_atoms:
-                break
+                atoms.append(
+                    EvidenceAtom(role.role_id, atom.sources, role.description, atom.value)
+                )
+            else:
+                atoms.append(EvidenceAtom(role.role_id, (), role.description, "unknown"))
         return atoms
 
-    prompt = build_proposal_prompt(question, len(image_paths), max_atoms)
+    prompt = build_proposal_prompt(question, specification, len(image_paths), max_atoms)
     raw = backend.generate_multimodal(prompt, list(image_paths), max_new_tokens=max_new_tokens)
-    atoms = parse_bridge_proposal(raw, num_images=len(image_paths), max_atoms=max_atoms)
-    if not atoms:
+    parsed = parse_bridge_proposal(raw, num_images=len(image_paths), max_atoms=max_atoms)
+    if not parsed:
         retry_prompt = (
             prompt
-            + "\n\nYour previous format was invalid. Emit at least one evidence object with "
-            "a non-empty sources list, a non-empty field, and a non-empty value. "
+            + "\n\nYour previous format was invalid. Emit one evidence object for every "
+            "specified role with its exact role_id, a non-empty sources list, and a value. "
             "Use only image numbers from 1 through "
             + str(len(image_paths))
             + ". Return the corrected JSON object now."
@@ -625,22 +523,28 @@ def propose_bridge(
         raw = backend.generate_multimodal(
             retry_prompt, list(image_paths), max_new_tokens=max_new_tokens
         )
-        atoms = parse_bridge_proposal(raw, num_images=len(image_paths), max_atoms=max_atoms)
-    # An empty proposal is a valid selective outcome: with no visual evidence
-    # entering the mediator, the response stage receives an explicitly unknown
-    # Bridge and should abstain. It must not fall back to benchmark annotations.
-    return atoms
+        parsed = parse_bridge_proposal(raw, num_images=len(image_paths), max_atoms=max_atoms)
+    return align_atoms_to_roles(parsed, roles)
 
 
-def proposal_source_slots(question: str, num_images: int) -> list[int]:
-    """Return question-named sources, or every source for an image search."""
+def align_atoms_to_roles(
+    atoms: Sequence[EvidenceAtom], roles: Sequence[EvidenceRole]
+) -> list[EvidenceAtom]:
+    """Preserve every specified role; missing proposals become unknown operands."""
 
-    named: list[int] = []
-    for match in IMAGE_UNIT_RE.findall(question):
-        source = int(match)
-        if 1 <= source <= num_images and source not in named:
-            named.append(source)
-    return named or list(range(1, num_images + 1))
+    by_role = {atom.role_id: atom for atom in atoms if atom.role_id}
+    aligned: list[EvidenceAtom] = []
+    for index, role in enumerate(roles):
+        atom = by_role.get(role.role_id)
+        if atom is None and index < len(atoms) and not atoms[index].role_id:
+            atom = atoms[index]
+        if atom is None:
+            aligned.append(EvidenceAtom(role.role_id, (), role.description, "unknown"))
+        else:
+            aligned.append(
+                EvidenceAtom(role.role_id, atom.sources, role.description, atom.value)
+            )
+    return aligned
 
 
 def certify_atom(
@@ -650,9 +554,27 @@ def certify_atom(
     backend: Any,
     config: CertificationConfig,
 ) -> dict[str, Any]:
-    """Estimate N_jk and apply the paper's G/A/multi-source tests."""
+    """Estimate N_jk and apply the paper's exact declared-source margin."""
 
     num_images = len(image_paths)
+    declared = {source - 1 for source in atom.sources if 1 <= source <= num_images}
+    if not declared or atom.value.casefold() in {"unknown", "unavailable"}:
+        return {
+            "role_id": atom.role_id,
+            "sources": list(atom.sources),
+            "field": atom.field,
+            "proposed_value": atom.value,
+            "value": "unknown",
+            "claim": atom.claim,
+            "certified": False,
+            "baseline_logprob": None,
+            "perturbed_logprobs": [],
+            "necessity": [],
+            "declared_min_necessity": None,
+            "strongest_competing_necessity": None,
+            "source_margin": None,
+        }
+
     prompt = build_atom_scoring_prompt(question, atom)
     baseline_gates = [1.0] * num_images
     baseline = backend.score_multimodal_completion(
@@ -675,15 +597,15 @@ def certify_atom(
         perturbed_scores.append(weakened)
         necessities.append((baseline - weakened) / config.epsilon)
 
-    declared = {source - 1 for source in atom.sources}
-    positive = [max(value, 0.0) for value in necessities]
-    grounding = sum(positive[index] for index in declared)
-    attribution = grounding / (sum(positive) + config.epsilon0)
-    multi_source_ok = len(declared) <= 1 or all(
-        necessities[index] > config.kappa_min for index in declared
-    )
-    certified = grounding > config.kappa and attribution > config.rho and multi_source_ok
+    declared_min = min(necessities[index] for index in declared)
+    competing = [
+        necessities[index] for index in range(num_images) if index not in declared
+    ]
+    strongest_competing = max([0.0, *competing])
+    source_margin = declared_min - strongest_competing
+    certified = source_margin > 0.0
     return {
+        "role_id": atom.role_id,
         "sources": list(atom.sources),
         "field": atom.field,
         "proposed_value": atom.value,
@@ -693,9 +615,60 @@ def certify_atom(
         "baseline_logprob": baseline,
         "perturbed_logprobs": perturbed_scores,
         "necessity": necessities,
-        "grounding": grounding,
-        "attribution": attribution,
-        "multi_source_ok": multi_source_ok,
+        "declared_min_necessity": declared_min,
+        "strongest_competing_necessity": strongest_competing,
+        "source_margin": source_margin,
+    }
+
+
+def compose_bridge(
+    backend: Any,
+    question: str,
+    specification: EvidenceSpecification,
+    certified_atoms: Sequence[dict[str, Any]],
+    bridge: str,
+    null: bool,
+    max_new_tokens: int,
+) -> dict[str, Any]:
+    """Execute the fixed operator after reset with unknown propagation."""
+
+    unresolved_roles = [
+        str(atom.get("role_id", atom.get("field", "unknown_role")))
+        for atom in certified_atoms
+        if null or str(atom.get("value", "unknown")).casefold() in {"unknown", "unavailable"}
+    ]
+    if unresolved_roles:
+        return {
+            "status": "unresolved",
+            "result": "unresolved",
+            "unresolved_roles": unresolved_roles,
+            "raw": None,
+        }
+
+    prompt = build_composition_prompt(question, specification, bridge)
+    raw = backend.generate_text(prompt, max_new_tokens=max_new_tokens).strip()
+    payload = extract_json_payload(raw)
+    if isinstance(payload, dict):
+        status = clean_scalar(payload.get("status", "resolved")).casefold() or "resolved"
+        result = clean_scalar(
+            payload.get("result", payload.get("composition", payload.get("value", "")))
+        )
+        steps = payload.get("steps", [])
+        if not isinstance(steps, list):
+            steps = [steps] if steps else []
+        return {
+            "status": status,
+            "result": result or "unresolved",
+            "steps": [clean_scalar(step) for step in steps if clean_scalar(step)],
+            "unresolved_roles": [],
+            "raw": raw,
+        }
+    return {
+        "status": "resolved" if raw else "unresolved",
+        "result": raw or "unresolved",
+        "steps": [],
+        "unresolved_roles": [],
+        "raw": raw,
     }
 
 
@@ -704,14 +677,20 @@ def verify_response(
     question: str,
     factual_bridge: str,
     null_bridge: str,
+    factual_composition: dict[str, Any],
+    null_composition: dict[str, Any],
     response: str,
     config: VerificationConfig,
 ) -> dict[str, Any]:
     factual_scores = backend.score_text_candidates(
-        build_verification_prompt(question, factual_bridge, response), ["Yes", "No"]
+        build_verification_prompt(
+            question, factual_bridge, factual_composition, response
+        ),
+        ["Yes", "No"],
     )
     null_scores = backend.score_text_candidates(
-        build_verification_prompt(question, null_bridge, response), ["Yes", "No"]
+        build_verification_prompt(question, null_bridge, null_composition, response),
+        ["Yes", "No"],
     )
     r1 = float(factual_scores["Yes"] - factual_scores["No"])
     r0 = float(null_scores["Yes"] - null_scores["No"])
@@ -727,91 +706,86 @@ def verify_response(
     }
 
 
-def build_proposal_prompt(question: str, num_images: int, max_atoms: int) -> str:
-    return f"""You are constructing a pre-response evidence ledger for a multi-image question.
+def build_specification_prompt(question: str, max_roles: int) -> str:
+    return f"""Specify the evidence structure required by the question before seeing any image or candidate answer.
+Question: {question}
+
+Define at most {max_roles} answer-free operand roles and one fixed composition operator.
+- A role states what evidence must be obtained, never its value.
+- Split cross-image requirements into separate roles whenever possible.
+- The operator states exactly how the filled roles must be combined.
+- For multi-step reasoning, list the operator DAG as ordered dependency steps.
+- Do not infer visual facts, mention an option, or give an answer.
+
+Return JSON only:
+{{"roles":[{{"id":"r1","description":"attribute of the object in Image 1"}}],"operator":{{"name":"compare","description":"compare r1 with r2","dag":["read r1 and r2","compare them"]}}}}"""
+
+
+def render_specification(specification: EvidenceSpecification) -> str:
+    lines = ["Fixed evidence specification:"]
+    for role in specification.roles:
+        lines.append(f"- {role.role_id}: {role.description}")
+    lines.append(f"Fixed operator: {specification.operator}")
+    if specification.operator_dag:
+        lines.append("Operator DAG:")
+        lines.extend(
+            f"  {index}. {step}"
+            for index, step in enumerate(specification.operator_dag, start=1)
+        )
+    return "\n".join(lines)
+
+
+def build_proposal_prompt(
+    question: str,
+    specification: EvidenceSpecification,
+    num_images: int,
+    max_atoms: int,
+) -> str:
+    return f"""Fill the already fixed evidence roles for a multi-image question.
 Question: {question}
 There are {num_images} images, numbered Image 1 through Image {num_images}.
 
-Before deciding or wording the answer, record at most {max_atoms} question-relevant atomic visual observations.
-- Each observation must have the exact image source(s) that visually support it.
-- Prefer separate single-image observations. Use multiple sources only for an irreducible cross-view identity or relation.
-- Cover every image explicitly named by the question with its own relevant observation before using any remaining slot.
-- For a comparison, record the requested attribute separately for both compared images; do not perform the comparison yet.
-- The field describes what must be observed; the value contains only the observed fact.
+{render_specification(specification)}
+
+Produce exactly one atomic operand for each listed role, up to {max_atoms} roles.
+- Copy each role_id exactly and provide the exact image source set supporting its value.
+- Do not add, remove, rename, or reinterpret roles.
+- Do not execute or replace the fixed operator.
 - Do not state a final answer, option letter, candidate choice, or answer recommendation.
 - Do not use captions, metadata, or outside knowledge.
 
 Return JSON only in this form:
-{{"evidence":[{{"sources":[1],"field":"relevant object color","value":"brown"}}]}}"""
+{{"evidence":[{{"role_id":"r1","sources":[1],"value":"brown"}}]}}"""
 
 
-def build_source_isolated_proposal_prompt(
-    question: str, source: int, num_images: int
+def build_role_proposal_prompt(
+    question: str,
+    specification: EvidenceSpecification,
+    role: EvidenceRole,
+    num_images: int,
 ) -> str:
-    if uses_binary_presence_schema(question):
-        raise ValueError("Binary presence atoms must use likelihood scoring")
-    value_instruction = (
-        "Record the requested object, attribute, state, or color as a short value."
-    )
-    example = (
-        f'{{"evidence":[{{"sources":[{source}],'
-        '"field":"relevant visual evidence","value":"visible observation"}]}'
-        "}"
-    )
-    return f"""You are constructing CARE-Bridge before response formation.
-The one shown image is original Image {source} from a {num_images}-image question.
+    return f"""Fill one role from an evidence structure fixed before image inspection.
 Question: {question}
+There are {num_images} images, numbered Image 1 through Image {num_images}.
 
-Record exactly one atomic visual observation from original Image {source} that is needed to answer the question.
-- Inspect only the shown pixels. Preserve its original source number {source}.
-- {value_instruction}
-- Do not compare images or state a final answer, option, or recommendation.
-- The field names what is inspected; the value contains only the observation.
+{render_specification(specification)}
+
+Fill only role {role.role_id}: {role.description}
+- Inspect pixels and report the exact supporting image source set.
+- Do not fill any other role or execute the operator.
+- Do not state an answer, option, or recommendation.
+- Use "unknown" only when the required operand cannot be identified.
 
 Return JSON only:
-{example}"""
-
-
-def uses_binary_presence_schema(question: str) -> bool:
-    explicit_count = len({int(match) for match in IMAGE_UNIT_RE.findall(question)})
-    lowered = question.casefold()
-    return (
-        explicit_count != 1
-        and "color comparison" not in lowered
-        and any(
-            cue in lowered
-            for cue in (
-                " visible",
-                "which image",
-                "which picture",
-                "which view",
-                "where ",
-                "where can",
-                "contains",
-                "appear",
-                "has the visible cue",
-                "shows ",
-            )
-        )
-    )
-
-
-def build_source_presence_prompt(
-    question: str, source: int, num_images: int
-) -> str:
-    return f"""The shown image is original Image {source} from a {num_images}-image question.
-Original question: {question}
-
-Considering only the complete visual cue requested by the question, is that cue visible in original Image {source}? Inspect pixels only. Answer Yes or No.
-Verdict:"""
+{{"evidence":[{{"role_id":"{role.role_id}","sources":[1],"value":"visible fact"}}]}}"""
 
 
 def build_atom_scoring_prompt(question: str, atom: EvidenceAtom) -> str:
     sources = ", ".join(f"Image {source}" for source in atom.sources)
     return f"""Complete one pre-response CARE-Bridge atom from the images.
 Question: {question}
+Required role: {atom.role_id}: {atom.field}
 Declared visual source: {sources}
-Atomic field: {atom.field}
 Write only the field value supported by the declared source.
 Value:"""
 
@@ -823,24 +797,71 @@ def build_baseline_prompt(question: str) -> str:
     )
 
 
-def build_generation_prompt(question: str, bridge: str) -> str:
-    return f"""Answer the question using only the CARE-Bridge below. The original images are unavailable.
+def build_composition_prompt(
+    question: str, specification: EvidenceSpecification, bridge: str
+) -> str:
+    return f"""Execute the fixed operator using only the supplied role values. The original images are unavailable.
+Question: {question}
+
+{render_specification(specification)}
+
+{bridge}
+
+- Do not retrieve, infer, or substitute a new operand.
+- Follow the fixed operator and its DAG exactly.
+- If any required role is unknown or unavailable, return status "unresolved".
+
+Return JSON only:
+{{"status":"resolved","steps":["operator step"],"result":"composition result"}}"""
+
+
+def render_composition(composition: dict[str, Any]) -> str:
+    lines = [f"Composition status: {composition.get('status', 'unresolved')}"]
+    steps = composition.get("steps") or []
+    if steps:
+        lines.append("Composition steps:")
+        lines.extend(f"- {step}" for step in steps)
+    lines.append(f"Composition result: {composition.get('result', 'unresolved')}")
+    unresolved = composition.get("unresolved_roles") or []
+    if unresolved:
+        lines.append("Unresolved roles: " + ", ".join(map(str, unresolved)))
+    return "\n".join(lines)
+
+
+def build_generation_prompt(
+    question: str,
+    specification: EvidenceSpecification,
+    bridge: str,
+    composition: dict[str, Any],
+) -> str:
+    return f"""Answer the question using only the fixed evidence computation below. The original images are unavailable.
 If required evidence is unknown, say that the answer cannot be determined.
 
 Question: {question}
 
+{render_specification(specification)}
+
 {bridge}
+
+{render_composition(composition)}
 
 Complete answer:"""
 
 
-def build_verification_prompt(question: str, bridge: str, response: str) -> str:
+def build_verification_prompt(
+    question: str,
+    bridge: str,
+    composition: dict[str, Any],
+    response: str,
+) -> str:
     return f"""The original images are unavailable. Judge only from the source-indexed CARE-Bridge.
-A response is supported only if every claim uses the correct image source, the requested relation is correct, all required evidence is present, and no required field is unknown or unavailable.
+A response is supported only if every claim uses the supplied operands and agrees with the explicit composition. Unknown, unavailable, or unresolved evidence cannot support a response.
 
 Question: {question}
 
 {bridge}
+
+{render_composition(composition)}
 
 Complete response: {response}
 
@@ -851,20 +872,15 @@ Verdict:"""
 def render_bridge(
     certified_atoms: Sequence[dict[str, Any]],
     null: bool,
-    retain_tentative: bool = False,
 ) -> str:
     lines = ["CARE-Bridge:"]
     for atom in certified_atoms:
         labels = ", ".join(f"Image {source}" for source in atom["sources"])
-        if null:
-            value = "unavailable"
-        elif atom.get("certified") or not retain_tentative:
-            value = str(atom["value"])
-        else:
-            value = str(atom.get("proposed_value", "unknown"))
-        status = "certified" if atom.get("certified") else "tentative"
-        suffix = f" [status: {status}]" if retain_tentative else ""
-        lines.append(f"- [{labels}] {atom['field']}: {value}{suffix}")
+        labels = labels or "no certified source"
+        value = "unavailable" if null else str(atom.get("value", "unknown"))
+        lines.append(
+            f"- {atom.get('role_id', 'role')} [{labels}] {atom['field']}: {value}"
+        )
     if len(lines) == 1:
         lines.append("- [no source] evidence: unavailable" if null else "- [no source] evidence: unknown")
     return "\n".join(lines)
@@ -884,7 +900,7 @@ def parse_bridge_proposal(raw: str, num_images: int, max_atoms: int) -> list[Evi
         items = payload
 
     atoms: list[EvidenceAtom] = []
-    seen: set[tuple[tuple[int, ...], str, str]] = set()
+    seen: set[tuple[str, tuple[int, ...], str, str]] = set()
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -894,6 +910,7 @@ def parse_bridge_proposal(raw: str, num_images: int, max_atoms: int) -> list[Evi
         sources = tuple(source for source in sources if 1 <= source <= num_images)
         if not sources:
             continue
+        role_id = clean_scalar(item.get("role_id", item.get("role", "")))
         field = clean_scalar(
             item.get("field", item.get("attribute", item.get("slot", "observation")))
         ) or "observation"
@@ -902,8 +919,8 @@ def parse_bridge_proposal(raw: str, num_images: int, max_atoms: int) -> list[Evi
         )
         if not value:
             continue
-        atom = EvidenceAtom(tuple(sorted(set(sources))), field, value)
-        key = (atom.sources, atom.field.casefold(), atom.value.casefold())
+        atom = EvidenceAtom(role_id, tuple(sorted(set(sources))), field, value)
+        key = (atom.role_id, atom.sources, atom.field.casefold(), atom.value.casefold())
         if key in seen:
             continue
         seen.add(key)
@@ -931,7 +948,7 @@ def parse_bridge_proposal(raw: str, num_images: int, max_atoms: int) -> list[Evi
         if not sources or not parts:
             continue
         field, value = (parts[0], parts[1]) if len(parts) >= 2 else ("observation", parts[0])
-        atoms.append(EvidenceAtom(tuple(sorted(set(sources))), field, value))
+        atoms.append(EvidenceAtom("", tuple(sorted(set(sources))), field, value))
         if len(atoms) >= max_atoms:
             break
     return atoms
