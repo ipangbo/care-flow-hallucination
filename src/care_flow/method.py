@@ -170,20 +170,9 @@ def run_care_flow_on_row(
     factual_bridge = render_bridge(certified_atoms, null=False)
     null_bridge = render_bridge(certified_atoms, null=True)
 
-    baseline_scores: dict[str, float] = {}
     baseline_generated: str | None = None
     if candidates:
         candidate_texts = [str(candidate.get("text", "")).strip() for candidate in candidates]
-        baseline_scores = backend.score_multimodal_candidates(
-            build_baseline_prompt(question), image_paths, candidate_texts
-        )
-        scored_baseline_candidate = max(
-            candidates,
-            key=lambda candidate: (
-                baseline_scores[str(candidate.get("text", "")).strip()],
-                str(candidate.get("candidate_id", "")),
-            ),
-        )
         if "_care_initial_candidate_id" in row:
             external_id = row.get("_care_initial_candidate_id")
             baseline_candidate = next(
@@ -196,8 +185,8 @@ def run_care_flow_on_row(
             )
             baseline_source = "external_full_release_vanilla"
         else:
-            baseline_candidate = scored_baseline_candidate
-            baseline_source = "candidate_commitment"
+            baseline_candidate = None
+            baseline_source = "not_provided"
         hypotheses = candidate_texts
     else:
         baseline_candidate = None
@@ -205,12 +194,7 @@ def run_care_flow_on_row(
             baseline_source = "external_full_release_vanilla"
             baseline_generated = str(row.get("_care_initial_answer") or "").strip()
         else:
-            baseline_source = "generated"
-            baseline_generated = backend.generate_multimodal(
-                build_baseline_prompt(question),
-                image_paths,
-                max_new_tokens=flow.answer_max_new_tokens,
-            ).strip()
+            baseline_source = "not_provided"
 
     # Constructed hard reset: every composition, generation, and verification
     # call below is a new text-only computation with no image-derived state.
@@ -276,9 +260,16 @@ def run_care_flow_on_row(
     )
     care_answer = selected["response"] if selected else None
     baseline_correct = (
-        bool(baseline_candidate and baseline_id == gold_id)
-        if candidates
-        else bool(reference_answer and exact_or_contains(baseline_answer or "", reference_answer))
+        None
+        if baseline_source == "not_provided"
+        else (
+            bool(baseline_candidate and baseline_id == gold_id)
+            if candidates
+            else bool(
+                reference_answer
+                and exact_or_contains(baseline_answer or "", reference_answer)
+            )
+        )
     )
     care_correct = (
         bool(selected_candidate and selected_id == gold_id)
@@ -318,7 +309,6 @@ def run_care_flow_on_row(
         "care_correct": care_correct,
         "care_error_label": selected_error_label(selected_candidate, gold_id),
         "care_selected_via": selected_via,
-        "baseline_scores": baseline_scores,
         "evidence_specification": asdict(specification),
         "provisional_bridge": [asdict(atom) | {"claim": atom.claim} for atom in provisional],
         "certified_bridge": certified_atoms,
@@ -790,13 +780,6 @@ Write only the field value supported by the declared source.
 Value:"""
 
 
-def build_baseline_prompt(question: str) -> str:
-    return (
-        f"Answer the multi-image question using the images.\nQuestion: {question}\n"
-        "Complete answer:"
-    )
-
-
 def build_composition_prompt(
     question: str, specification: EvidenceSpecification, bridge: str
 ) -> str:
@@ -1059,15 +1042,18 @@ def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         return {"n": 0, "runtime_errors": len(records)}
     total = len(valid_records)
     accepted = [record for record in valid_records if not record.get("care_abstained", True)]
-    baseline_correct = sum(bool(record.get("baseline_correct")) for record in valid_records)
+    paired_records = [
+        record for record in valid_records if record.get("baseline_correct") is not None
+    ]
+    baseline_correct = sum(bool(record.get("baseline_correct")) for record in paired_records)
     care_correct = sum(bool(record.get("care_correct")) for record in valid_records)
     corrected = sum(
         not record.get("baseline_correct") and record.get("care_correct")
-        for record in valid_records
+        for record in paired_records
     )
     harmed = sum(
         record.get("baseline_correct") and not record.get("care_correct")
-        for record in valid_records
+        for record in paired_records
     )
     accepted_correct = sum(bool(record.get("care_correct")) for record in accepted)
 
@@ -1107,13 +1093,27 @@ def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "n": total,
         "runtime_errors": len(records) - total,
-        "baseline_accuracy": baseline_correct / total,
+        "paired_baseline_n": len(paired_records),
+        "baseline_accuracy": (
+            baseline_correct / len(paired_records) if paired_records else None
+        ),
         "care_accuracy": care_correct / total,
-        "accuracy_gain": (care_correct - baseline_correct) / total,
+        "accuracy_gain": (
+            sum(
+                int(bool(record.get("care_correct")))
+                - int(bool(record.get("baseline_correct")))
+                for record in paired_records
+            )
+            / len(paired_records)
+            if paired_records
+            else None
+        ),
         "corrected": corrected,
         "harmed": harmed,
         "net_corrections": corrected - harmed,
-        "accuracy_gain_ci95": paired_bootstrap_gain_ci(valid_records),
+        "accuracy_gain_ci95": (
+            paired_bootstrap_gain_ci(paired_records) if paired_records else None
+        ),
         "mcnemar_exact_two_sided_p": exact_mcnemar_p(corrected, harmed),
         "care_coverage": len(accepted) / total,
         "care_selective_accuracy": accepted_correct / len(accepted) if accepted else None,

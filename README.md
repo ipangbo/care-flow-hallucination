@@ -5,12 +5,13 @@ experiments:
 
 1. download and normalize a public multi-image benchmark;
 2. run a zero-shot Vanilla backbone;
-3. run CARE with the same Vanilla prediction as its paired initial hypothesis;
+3. run strict mediator-only CARE and pair the external Vanilla prediction for
+   matched metrics only;
 4. write per-example JSONL predictions and an aggregate JSON summary.
 
-It intentionally excludes datasets, model weights, figures, ablations, dataset
-construction code, and paper-writing utilities, so the directory can be
-compressed and shared directly.
+It includes the annotation-only CARE-Bench release, but excludes all image
+binaries, model weights, figures, ablations, dataset-construction code, and
+paper-writing utilities.
 
 ## Included models
 
@@ -46,7 +47,63 @@ memory in BF16/FP16. Reducing `--max-image-side` lowers visual-token memory.
 
 ## Obtaining the datasets
 
-No dataset is included. `prepare_data.py` downloads the official release and
+### CARE-Bench annotations and source images
+
+The repository tracks annotations for all three CARE-Bench domains:
+
+```text
+datasets/care_bench/
+├── coco_vqa/   # 11,132 questions
+├── te_papa/    # 368 questions
+└── generated/  # 500 questions
+```
+
+Each directory contains `examples.jsonl` plus a deduplicated `images.jsonl`
+source registry. Image binaries are not tracked. The runners expect them under
+the corresponding `images/` directory.
+
+For **COCO-VQA**, download the official MS COCO 2014 train, validation, and
+test image archives. CARE-Bench questions and answers are already included, so
+the original VQA question annotations are not required.
+
+```bash
+mkdir -p raw/coco2014
+cd raw/coco2014
+wget http://images.cocodataset.org/zips/train2014.zip
+wget http://images.cocodataset.org/zips/val2014.zip
+wget http://images.cocodataset.org/zips/test2014.zip
+unzip train2014.zip
+unzip val2014.zip
+unzip test2014.zip
+cd ../..
+
+python prepare_carebench_images.py \
+  --domain coco_vqa \
+  --source-root raw/coco2014
+```
+
+The preparation command checks every referenced filename and creates relative
+symbolic links under `datasets/care_bench/coco_vqa/images/`. Add `--copy` when
+symbolic links are unsuitable.
+
+For **Te Papa**, every released record is marked downloadable and its official
+media URL is stored in `datasets/care_bench/te_papa/images.jsonl`. Download the
+referenced files directly with:
+
+```bash
+python prepare_carebench_images.py --domain te_papa --download
+```
+
+Te Papa image rights vary by record. Keep the provided `license`,
+`license_url`, `attribution`, and `object_url` metadata with any reuse, and
+follow the [Te Papa Collections API terms](https://www.tepapa.govt.nz/api-terms-of-use).
+
+The **Generated** domain is released as annotations only. Its 1,925 generated
+image binaries are deliberately absent from this Git repository.
+
+### External multi-image benchmarks
+
+`prepare_data.py` downloads each external benchmark's official release and
 converts it to the common manifest expected by both runners:
 
 ```text
@@ -108,7 +165,7 @@ python run_vanilla.py \
   --output results/qwen3.5-9b_muirbench_vanilla.jsonl
 ```
 
-Then run CARE using that prediction as the paired initial hypothesis:
+Then run CARE with that file attached only for paired Vanilla/CARE metrics:
 
 ```bash
 python run_care.py \
@@ -148,12 +205,18 @@ the JSONL shards before summarizing.
 
 For each example, `run_care.py` performs the main paper path only:
 
-1. proposes a compact, source-indexed CARE-Bridge from the images;
-2. certifies each atom by intervening on the corresponding image source's
+1. fixes answer-free operand roles and an operator/DAG from the question alone;
+2. fills only those fixed roles from the images;
+3. certifies each atom by intervening on the corresponding image source's
    post-softmax value contribution in every supported language-attention block;
-3. drops all image-derived state;
-4. scores the candidate response against factual and null Bridges;
-5. applies the paired verification/reranking rule and writes the result.
+4. replaces every failed operand with `unknown` and drops all image-derived
+   state;
+5. executes the fixed operator separately on factual and null Bridges;
+6. accepts only candidates with `R1 > 0` and `Delta_FD > 0`, selects the valid
+   candidate with maximum `R1`, and abstains if the valid set is empty.
+
+The attached Vanilla prediction and its score never enter specification,
+acquisition, certification, composition, verification, or final selection.
 
 For Qwen3.5, the intervention is applied to its explicit full-attention blocks;
 linear-attention blocks remain unchanged. The LLaVA-NeXT and InternVL3
@@ -183,9 +246,11 @@ care_core_release/
 ├── pyproject.toml
 ├── requirements.txt
 ├── prepare_data.py
+├── prepare_carebench_images.py
 ├── run_vanilla.py
 ├── run_care.py
 ├── run_all.sh
+├── datasets/care_bench/       # annotations only; no image binaries
 └── src/care_flow/
     ├── data.py
     ├── method.py

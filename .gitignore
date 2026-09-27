@@ -21,6 +21,19 @@ outputs/
 *.jsonl
 *.summary.json
 
+# Public CARE-Bench annotation-only release (image binaries remain ignored).
+!datasets/
+datasets/*
+!datasets/care_bench/
+datasets/care_bench/*
+!datasets/care_bench/README.md
+!datasets/care_bench/coco_vqa/
+!datasets/care_bench/te_papa/
+!datasets/care_bench/generated/
+!datasets/care_bench/*/examples.jsonl
+!datasets/care_bench/*/images.jsonl
+datasets/care_bench/*/images/
+
 # Editor and OS metadata
 .DS_Store
 .idea/
