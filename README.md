@@ -99,7 +99,7 @@ Te Papa image rights vary by record. Keep the provided `license`,
 follow the [Te Papa Collections API terms](https://www.tepapa.govt.nz/api-terms-of-use).
 
 The **Generated** domain is released as annotations only. Its 1,925 generated
-image binaries are deliberately absent from this Git repository.
+image binaries will be deliberately absent from this Git repository.
 
 ### External multi-image benchmarks
 
@@ -201,8 +201,6 @@ For multiple GPUs, launch the same command with different
 `--num-shards/--shard-index` values and distinct output files, then concatenate
 the JSONL shards before summarizing.
 
-## What the CARE runner executes
-
 For each example, `run_care.py` performs the main paper path only:
 
 1. fixes answer-free operand roles and an operator/DAG from the question alone;
@@ -250,7 +248,7 @@ care_core_release/
 ├── run_vanilla.py
 ├── run_care.py
 ├── run_all.sh
-├── datasets/care_bench/       # annotations only; no image binaries
+├── datasets/care_bench/
 └── src/care_flow/
     ├── data.py
     ├── method.py
