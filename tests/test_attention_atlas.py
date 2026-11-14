@@ -40,19 +40,36 @@ class AttentionAtlasTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "key 'hca'"):
                 atlas.load_hca(path)
 
-    def test_rejects_interleave_metadata(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "test.npz"
-            np.savez(path, hca=self.matrix, model_id="llava-hf/llava-interleave-qwen-7b-hf")
-            with self.assertRaisesRegex(ValueError, "Expected.*measurements"):
-                atlas.load_hca(path)
-
-    def test_rejects_old_metrics_sidecar(self):
+    def test_accepts_interleave_metrics_sidecar(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "test.npy"
             np.save(path, self.matrix)
             path.with_name("metrics.json").write_text(
                 json.dumps({"model_id": "llava-hf/llava-interleave-qwen-7b-hf"}), encoding="utf-8")
+            np.testing.assert_array_equal(atlas.load_hca(path), self.matrix)
+
+    def test_rejects_llava15_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test.npz"
+            np.savez(path, hca=self.matrix, model_id="llava-hf/llava-1.5-7b-hf")
+            with self.assertRaisesRegex(ValueError, "Expected.*measurements"):
+                atlas.load_hca(path)
+
+    def test_rejects_llava15_metrics_sidecar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test.npy"
+            np.save(path, self.matrix)
+            path.with_name("metrics.json").write_text(
+                json.dumps({"model_id": "llava-hf/llava-1.5-7b-hf"}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Expected.*measurements"):
+                atlas.load_hca(path)
+
+    def test_rejects_conflicting_npz_and_sidecar_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test.npz"
+            np.savez(path, hca=self.matrix, model_id=atlas.MODEL_ID)
+            path.with_name("metrics.json").write_text(
+                json.dumps({"model_id": "llava-hf/llava-1.5-7b-hf"}), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "Expected.*measurements"):
                 atlas.load_hca(path)
 

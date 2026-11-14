@@ -10,9 +10,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-MODEL_ID = "llava-hf/llava-1.5-7b-hf"
-MODEL_IDS = {MODEL_ID, "liuhaotian/llava-v1.5-7b"}
-SHAPE = (32, 32)  # The Vicuna-7B language decoder, not the CLIP vision encoder.
+MODEL_ID = "llava-hf/llava-interleave-qwen-7b-hf"
+MODEL_NAME = "LLaVA-Interleave-Qwen-7B"
+MODEL_IDS = {MODEL_ID}
+SHAPE = (32, 32)  # The Qwen language decoder, not the vision encoder.
 
 # Original HCA data supplied by the user (reference only; not loaded automatically).
 # Rows are decoder layers; columns are original attention heads, before reordering.
@@ -55,7 +56,7 @@ SHAPE = (32, 32)  # The Vicuna-7B language decoder, not the CLIP vision encoder.
 def validate_hca(values: np.ndarray) -> np.ndarray:
     atlas = np.asarray(values, dtype=np.float64)
     if atlas.shape != SHAPE or not np.isfinite(atlas).all():
-        raise ValueError("Expected a finite 32x32 LLaVA-1.5-7B HCA matrix")
+        raise ValueError(f"Expected a finite 32x32 {MODEL_NAME} HCA matrix")
     if np.any((atlas < 0) | (atlas > 1)):
         raise ValueError("HCA values must lie in [0, 1]; values are not rescaled")
     return atlas
@@ -123,8 +124,7 @@ def plot_atlas(values: np.ndarray, output: Path, head_order: str = "clustered-sy
     with plt.rc_context(style):
         fig, ax = plt.subplots(figsize=(3.70, 2.85))
         try:
-            # Full theoretical range prevents silently saturating new data at
-            # the old Interleave figure's narrower [0.20, 0.90] color limits.
+            # Keep the full theoretical HCA range; never rescale input values.
             image = ax.imshow(atlas[:, order], cmap="magma", origin="upper",
                               interpolation="nearest", aspect="equal", vmin=0, vmax=1)
             ticks = [0, 7, 15, 23, 31]
@@ -155,8 +155,8 @@ def plot_atlas(values: np.ndarray, output: Path, head_order: str = "clustered-sy
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("input", type=Path, help="LLaVA-1.5-7B HCA .npy or .npz (key: hca)")
-    parser.add_argument("--output", type=Path, default=Path(__file__).with_name("llava15_attention_atlas"),
+    parser.add_argument("input", type=Path, help=f"{MODEL_NAME} HCA .npy or .npz (key: hca)")
+    parser.add_argument("--output", type=Path, default=Path(__file__).with_name("llava_interleave_qwen7b_attention_atlas"),
                         help="Output path stem, without extension")
     parser.add_argument("--head-order", choices=("clustered-symmetric", "original"), default="clustered-symmetric")
     args = parser.parse_args()
